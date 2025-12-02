@@ -1,85 +1,140 @@
-#!/usr/bin/env python3
-import os, time, re, html, hashlib, logging, requests
+import os
+import time
+import re
+import html
+import requests
 from bs4 import BeautifulSoup
-
-logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s: %(message)s")
-log = logging.getLogger("ivas_requests_bot")
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 IVAS_EMAIL = os.getenv("IVAS_EMAIL")
 IVAS_PASSWORD = os.getenv("IVAS_PASSWORD")
 
-IVAS_LOGIN = "https://www.ivasms.com/portal/login"
-IVAS_SMS = "https://www.ivasms.com/portal/live/my_sms"
+TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
 
-def send_telegram(txt):
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/120 Safari/537.36"
+}
+
+BASE = "https://www.ivasms.com"
+
+
+def send_telegram(text):
     try:
-        requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            data={"chat_id": CHAT_ID, "text": txt, "parse_mode": "HTML"},
-            timeout=10)
-    except: pass
+        r = requests.post(
+            TELEGRAM_API,
+            data={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"},
+            timeout=10
+        )
+        return r.status_code == 200
+    except:
+        return False
 
-def extract_otp(txt):
-    m = re.search(r"(?<!\d)\d{4,8}(?!\d)", txt)
+
+def login(session):
+    """
+    IVAS login works through API endpoint, not through HTML form.
+    This bypass avoids JavaScript.
+    """
+
+    login_url = BASE + "/portal/login"
+    auth_url = BASE + "/portal/login"
+
+    # Step-1: get CSRF token
+    r = session.get(login_url, headers=HEADERS, timeout=15)
+    soup = BeautifulSoup(r.text, "html.parser")
+    token = soup.find("input", {"name": "_token"})
+    csrf = token.get("value") if token else ""
+
+    payload = {
+        "_token": csrf,
+        "email": IVAS_EMAIL,
+        "password": IVAS_PASSWORD
+    }
+
+    # Step-2: login POST
+    r = session.post(auth_url, headers=HEADERS, data=payload, timeout=15)
+
+    # Step-3: verify login
+    live = session.get(BASE + "/portal/live/my_sms", headers=HEADERS, timeout=15)
+    if "login" in live.url.lower():
+        return False
+    return True
+
+
+def fetch_sms(session):
+    url = BASE + "/portal/live/my_sms"
+    r = session.get(url, headers=HEADERS, timeout=15)
+    sms_list = []
+
+    soup = BeautifulSoup(r.text, "html.parser")
+    table = soup.find("table")
+    if not table:
+        return sms_list
+
+    rows = table.find_all("tr")[1:]
+    for row in rows:
+        cols = row.find_all("td")
+        if len(cols) < 4:
+            continue
+        number = cols[0].get_text(strip=True)
+        sid = cols[1].get_text(strip=True) or "IVAS"
+        msg = cols[3].get_text(strip=True)
+
+        if msg and "No messages" not in msg:
+            sms_list.append((number, sid, msg))
+
+    return sms_list
+
+
+def extract_otp(message):
+    m = re.search(r"(?<!\d)\d{4,8}(?!\d)", message)
     return m.group(0) if m else "Not Found"
 
-def parse_sms(html):
-    soup = BeautifulSoup(html, "html.parser")
-    table = soup.find("table")
-    res = []
-    if not table: return res
-    rows = table.find_all("tr")[1:]
-    for r in rows:
-        td = r.find_all("td")
-        if len(td) < 4: continue
-        num = td[0].get_text(strip=True)
-        sid = td[1].get_text(strip=True) or "IVAS"
-        msg = td[3].get_text(strip=True)
-        if msg and msg != "No messages":
-            res.append({"num": num, "sid": sid, "msg": msg})
-    return res
-
-def login(sess):
-    r = sess.get(IVAS_LOGIN)
-    from bs4 import BeautifulSoup
-    soup = BeautifulSoup(r.text, "html.parser")
-    form = soup.find("form")
-    data = {}
-    for i in form.find_all("input"):
-        if i.get("name"):
-            data[i.get("name")] = i.get("value","")
-    data["email"] = IVAS_EMAIL
-    data["password"] = IVAS_PASSWORD
-    sess.post(IVAS_LOGIN, data=data)
-    x = sess.get(IVAS_SMS)
-    return "login" not in x.url.lower()
 
 def main():
-    sess = requests.Session()
-    sess.headers.update({"User-Agent": "Mozilla/5.0"})
-    if not login(sess):
-        log.error("Login failed")
+    if not (TELEGRAM_TOKEN and CHAT_ID and IVAS_EMAIL and IVAS_PASSWORD):
+        print("Missing secrets!")
         return
-    send_telegram("IVAS Bot Started ✔️")
+
+    session = requests.Session()
+    session.headers.update(HEADERS)
+
+    print("[INFO] Logging in to IVAS...")
+    if not login(session):
+        print("[ERROR] Login failed!")
+        send_telegram("❌ IVAS Login Failed!")
+        return
+
+    print("[INFO] Login successful")
+    send_telegram("✅ IVAS Bot Started — Monitoring SMS")
+
     seen = set()
+
     while True:
         try:
-            r = sess.get(IVAS_SMS)
-            sms = parse_sms(r.text)
-            for s in sms:
-                uid = hashlib.sha1((s["num"] + s["msg"]).encode()).hexdigest()
-                if uid in seen: 
-                    continue
-                seen.add(uid)
-                otp = extract_otp(s["msg"])
-                msg = f"📩 New OTP\nOTP: <code>{otp}</code>\nService: {s['sid']}\nNumber: +{s['num']}\n\n<pre>{html.escape(s['msg'])}</pre>"
-                send_telegram(msg)
+            sms_list = fetch_sms(session)
+            for num, sid, msg in sms_list:
+                key = num + "|" + msg[:100]
+                if key not in seen:
+                    otp = extract_otp(msg)
+                    text = (
+                        f"<b>New OTP Received</b>\n"
+                        f"OTP: <code>{otp}</code>\n\n"
+                        f"<b>Number:</b> +{num}\n"
+                        f"<b>Service:</b> {sid}\n\n"
+                        f"<pre>{html.escape(msg)}</pre>"
+                    )
+                    send_telegram(text)
+                    seen.add(key)
+
             time.sleep(30)
+
         except Exception as e:
-            log.error(e)
+            print("Loop error:", e)
             time.sleep(10)
+
 
 if __name__ == "__main__":
     main()
